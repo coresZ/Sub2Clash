@@ -77,5 +77,5 @@ def run(username: str, password: str, apk_path: str) -> None:
 if __name__ == '__main__':
     username = '1234Abcd@gmail.com'  # 这里填邮箱
     password = '1234Abcd'  # 这里填密码
-    apk_path = "/Volumes/Data/Downloads/ziyoumao-3.1.0-universal.apk"  # 这里填apk的路径
+    apk_path = ""  # 这里填apk的路径
     run(username, password, apk_path)

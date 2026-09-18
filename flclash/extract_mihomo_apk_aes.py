@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -42,19 +43,28 @@ def extract_lib(apk_path, abi, out_dir):
     return out
 
 
-def check_mihomo_symbols(lib_path):
+def detect_scheme(lib_path):
+    """Scheme A = upstream convert.DecodeAESBase64, scheme B = FlyingBird-Lite's main-pkg fork."""
     data = Path(lib_path).read_bytes()
-    rx = rb"metacubex/mihomo/common/convert\.[A-Za-z0-9]+"
-    symbols = sorted(set(m.group(0).decode("ascii") for m in re.finditer(rx, data)))
-    has_decode = any(s.endswith("DecodeAESBase64") for s in symbols)
-    has_aes = any(s.endswith("aesDecryptCBC") for s in symbols)
-    if not (has_decode and has_aes):
-        found = "\n".join(f"  {s}" for s in symbols[:50]) or "  <none>"
-        raise Die(
-            "mihomo convert DecodeAESBase64/aesDecryptCBC symbols were not found.\n"
-            f"scanned convert symbols:\n{found}"
-        )
-    return symbols
+
+    convert_rx = rb"metacubex/mihomo/common/convert\.[A-Za-z0-9]+"
+    convert_syms = sorted({m.group(0).decode("ascii") for m in re.finditer(convert_rx, data)})
+    has_a = any(s.endswith("DecodeAESBase64") for s in convert_syms) and any(
+        s.endswith("aesDecryptCBC") for s in convert_syms
+    )
+
+    b_prefixes = ("main.configSecretBytes", "main.diskXorKey", "main.xorDiskTransform")
+    main_rx = rb"main\.[A-Za-z0-9_]+(?:\.func\d+)?"
+    b_hits = sorted(
+        {m.group(0).decode("ascii") for m in re.finditer(main_rx, data) if m.group(0).decode("ascii").startswith(b_prefixes)}
+    )
+
+    a_evidence = [s for s in convert_syms if "AES" in s or "aes" in s][:6] or convert_syms[:6]
+    if b_hits:
+        return "B", b_hits[:6]
+    if has_a:
+        return "A", a_evidence
+    return "?", convert_syms[:6]
 
 
 def cstr(data, off):
@@ -223,22 +233,81 @@ class GoPclnTable:
         return out
 
 
+def _pclntab_header_ok(blob):
+    """Validate a pcHeader candidate.
+
+    A bare magic match is not enough: the moduledata embedded in .data.rel.ro
+    carries a copy of the magic bytes, and linker padding produces runs of 0xf0.
+    Those decode to garbage pad/minLC/ptrsize, so check the header fields and then
+    that the functab the header describes actually fits inside the section.
+    """
+    if len(blob) < 72:
+        return False
+    if blob[4] != 0 or blob[5] != 0 or blob[6] not in (1, 2, 4) or blob[7] not in (4, 8):
+        return False
+
+    magic = int.from_bytes(blob[:4], "little")
+    ptrsize = blob[7]
+    if magic == 0xFFFFFFFB:  # ver12 predates the pcHeader struct
+        return True
+    if magic not in (0xFFFFFFF1, 0xFFFFFFF0, 0xFFFFFFFA):
+        return False
+
+    nfunc = int.from_bytes(blob[8 : 8 + ptrsize], "little")
+    if not 0 < nfunc < 20_000_000:
+        return False
+
+    field_size = 4 if magic in (0xFFFFFFF1, 0xFFFFFFF0) else ptrsize
+    pcln_off = int.from_bytes(blob[8 + 7 * ptrsize : 8 + 8 * ptrsize], "little")
+    return pcln_off + (nfunc * 2 + 1) * field_size <= len(blob)
+
+
+def _go_text_base(pclntab_vaddr, relocs, text_vaddr, text_end):
+    """Go's text origin, which is not the ELF .text vaddr.
+
+    entryoff in the functab is relative to runtime.text.  A c-shared build prefixes
+    .text with the C runtime preamble, so runtime.text sits some way in.  moduledata
+    holds the real value: it is the struct owning the pcHeader pointer, and its
+    minpc/text field is that base.  Locate moduledata by the relocation whose addend
+    is the pclntab itself, then take the first field in it that lands inside .text.
+    """
+    if pclntab_vaddr == 0:
+        return text_vaddr
+    for addr, addend in relocs.items():
+        if addend != pclntab_vaddr:
+            continue
+        for off in range(0, 0x200, 8):
+            value = relocs.get(addr + off)
+            if value is not None and text_vaddr <= value < text_end:
+                return value
+        break
+    return text_vaddr
+
+
 def find_go_pclntab_in_elf64_le(lib_path):
     data = Path(lib_path).read_bytes()
     sections = read_elf64_le_sections(data)
-    text_addr = next((s["addr"] for s in sections if s["name"] == ".text"), 0)
-    if text_addr == 0:
+    text_section = next((s for s in sections if s["name"] == ".text"), None)
+    if not text_section or not text_section["addr"]:
         raise Die("missing .text address")
+    text_vaddr = text_section["addr"]
+    text_end = text_vaddr + text_section["size"]
+    relocs = read_relocations(data, sections)
 
     magics = (b"\xf1\xff\xff\xff", b"\xf0\xff\xff\xff", b"\xfa\xff\xff\xff", b"\xfb\xff\xff\xff")
-    search_sections = [s for s in sections if s["name"] == ".data.rel.ro"]
-    search_sections.extend(s for s in sections if s["name"] != ".data.rel.ro")
+    search_sections = [s for s in sections if s["name"] == ".gopclntab"]
+    search_sections.extend(
+        s for s in sections if s["name"] not in (".gopclntab", ".text")
+    )
     for section in search_sections:
         blob = section["data"]
         for magic in magics:
             pos = blob.find(magic)
-            if pos >= 0:
-                return blob[pos:], text_addr
+            while pos >= 0:
+                if _pclntab_header_ok(blob[pos:]):
+                    base = _go_text_base(section["addr"] + pos, relocs, text_vaddr, text_end)
+                    return blob[pos:], base
+                pos = blob.find(magic, pos + 1)
     raise Die("missing Go pclntab magic in ELF sections")
 
 
@@ -296,10 +365,401 @@ def extract_arm64_movk_constants(lines):
     return constants[:4]
 
 
+# ---------------------------------------------------------------------------
+# Scheme B - the FlyingBird-Lite / securitynet mihomo fork.
+#
+# convert.DecodeAESBase64 is gone and the on-disk profile is binary:
+#
+#   file --xor--> base64 ascii --b64decode--> nonce(12) | ct | tag(16)
+#                                               --AES-256-GCM--> plaintext YAML
+#
+# The XOR layer is disk-only; the panel serves bare base64 over the wire.  Both
+# pieces of key material are built at runtime from obfuscated arrays, so neither
+# exists as a literal anywhere in the binary:
+#
+#   main.diskXorKey.func1    35 B disk XOR key = obf[i] ^ 0xa7
+#   main.configSecretBytes   32 B seed = three arrays of length 10/10/12:
+#        dst1[i] = (src1[i] ^ ((i + 195) & 0xff)) ^ 0x5a
+#        dst2[i] = (src2[i] - i - 60) & 0xff
+#        dst3[i] = ror8(src3[i] ^ 0xa7, (i % 5) + 1)
+#
+# and the GCM key is sha256(seed) - the 32 ascii bytes are a seed, not the key.
+# ---------------------------------------------------------------------------
+
+FB_OBF_XOR = 0xA7
+FB_DISK_XOR_LEN = 35
+FB_SEED_CHUNKS = (10, 10, 12)
+FB_SEED_A_ADD = 195
+FB_SEED_A_XOR = 0x5A
+FB_SEED_B_SUB = 60
+FB_SEED_C_XOR = 0xA7
+FB_SEED_C_ROL = 5
+FB_SEED_LEN = sum(FB_SEED_CHUNKS)
+FB_NEED = max(FB_DISK_XOR_LEN, FB_SEED_LEN)
+
+IMM_RX = re.compile(r"\b(mov|movz|movk|movn)\s+(w|x)(\d+),\s*#(0x[0-9a-fA-F]+|\d+)")
+SHIFT_RX = re.compile(r",\s*lsl\s*#(\d+)")
+ADRP_RX = re.compile(r"\badrp\s+(x\d+),\s*(?:0x)?([0-9a-fA-F]+)\b")
+ADD_RX = re.compile(r"\badd\s+(x\d+),\s*(x\d+),\s*#(0x[0-9a-fA-F]+|\d+)")
+LDR_RX = re.compile(r"\bldr\s+(x\d+),\s*\[(x\d+)(?:,\s*#(0x[0-9a-fA-F]+|\d+))?\]")
+MOV_RX = re.compile(r"\bmov\s+(x\d+),")
+INSN_ADDR_RX = re.compile(r"^\s*([0-9a-f]+):")
+
+
+def arch_imm(text):
+    """llvm-objdump prints arm64 immediates in decimal; only 0x-prefixed ones are hex."""
+    return int(text, 16) if text.lower().startswith("0x") else int(text, 10)
+
+
+def ror8(value, n):
+    n %= 8
+    return ((value >> n) | (value << (8 - n))) & 0xFF
+
+
+def is_printable(data, length):
+    return len(data) == length and all(0x20 <= b < 0x7F for b in data)
+
+
+def fb_seed_first(obf):
+    return bytes((v ^ ((i + FB_SEED_A_ADD) & 0xFF)) ^ FB_SEED_A_XOR for i, v in enumerate(obf[:10]))
+
+
+def fb_seed_second(obf):
+    return bytes((v - i - FB_SEED_B_SUB) & 0xFF for i, v in enumerate(obf[:10]))
+
+
+def fb_seed_third(obf):
+    return bytes(ror8(v ^ FB_SEED_C_XOR, (i % FB_SEED_C_ROL) + 1) for i, v in enumerate(obf[:12]))
+
+
+def fb_disk_xor_key(obf):
+    """main.diskXorKey.func1 - xor with 0xa7 is its own inverse."""
+    return bytes(b ^ FB_OBF_XOR for b in obf[:FB_DISK_XOR_LEN])
+
+
+def fb_config_secret(obf):
+    """main.configSecretBytes - undo the three obfuscated arrays into the ascii seed."""
+    if len(obf) < FB_SEED_LEN:
+        return None
+    n1, n2, _ = FB_SEED_CHUNKS
+    return (
+        fb_seed_first(obf[:n1])
+        + fb_seed_second(obf[n1 : n1 + n2])
+        + fb_seed_third(obf[n1 + n2 : FB_SEED_LEN])
+    )
+
+
+def arm64_immediate_stream(lines):
+    """Reassemble movz/movk chains into complete 32/64-bit constants, in program order.
+
+    A `mov`/`movz` is held back until either the movk chain that builds it finishes, or
+    the register is used for something else (in which case it was a standalone constant).
+    """
+    regs = {}
+    pending = {}
+    out = []
+    for raw in lines:
+        line = raw.strip()
+        m = IMM_RX.search(line)
+        if not m:
+            continue
+        op = m.group(1)
+        width = 4 if m.group(2) == "w" else 8
+        reg = int(m.group(3))
+        imm = int(m.group(4), 0)
+        shift_m = SHIFT_RX.search(line)
+        shift = int(shift_m.group(1)) if shift_m else 0
+        mask = (1 << (width * 8)) - 1
+
+        if op == "movk":
+            if reg not in regs:
+                continue
+            if shift:
+                pending.pop(reg, None)
+            value = (regs[reg] & ~(0xFFFF << shift)) | ((imm & 0xFFFF) << shift)
+            regs[reg] = value
+            if shift == width * 8 - 16:
+                out.append((value, width, line))
+            continue
+
+        if reg in pending:
+            out.append(pending.pop(reg))
+        value = (~imm if op == "movn" else imm << shift) & mask
+        regs[reg] = value
+        pending[reg] = (value, width, line)
+
+    out.extend(pending.values())
+    return out
+
+
+def imm_stream_bytes(stream, start, need, force_width=None):
+    buf = bytearray()
+    for value, width, _ in stream[start:]:
+        buf += value.to_bytes(force_width or width, "little", signed=False)
+        if len(buf) >= need:
+            break
+    return bytes(buf)
+
+
+def read_relocations(data, sections):
+    """instruction vaddr -> relocation addend; Go c-shared .so resolve adrp targets this way."""
+    out = {}
+    for name in (".rela.dyn", ".rela.plt"):
+        sec = next((s for s in sections if s["name"] == name), None)
+        if not sec or not sec["data"]:
+            continue
+        blob = sec["data"]
+        for off in range(0, len(blob) - 24 + 1, 24):  # Elf64_Rela
+            r_offset = int.from_bytes(blob[off : off + 8], "little")
+            r_addend = int.from_bytes(blob[off + 16 : off + 24], "little", signed=True)
+            out.setdefault(r_offset, r_addend)
+    return out
+
+
+def arm64_global_addrs(lines, relocs):
+    """Best-effort absolute vaddrs for adrp+add / adrp+ldr data references."""
+    regs = {}
+    out = []
+    for raw in lines:
+        line = raw.strip()
+        addr_m = INSN_ADDR_RX.match(raw)
+        insn = int(addr_m.group(1), 16) if addr_m else None
+
+        m = ADRP_RX.search(line)
+        if m:
+            page = relocs.get(insn)
+            regs[m.group(1)] = int(m.group(2), 16) if page is None else page
+            continue
+
+        m = ADD_RX.search(line)
+        if m:
+            dst, src = m.group(1), m.group(2)
+            if src in regs:
+                regs[dst] = regs[src] + arch_imm(m.group(3))
+                out.append(regs[dst])
+            else:
+                regs.pop(dst, None)
+            continue
+
+        m = LDR_RX.search(line)
+        if m:
+            dst, src = m.group(1), m.group(2)
+            if src in regs:
+                out.append(regs[src] + (arch_imm(m.group(3)) if m.group(3) else 0))
+            regs.pop(dst, None)  # the register now holds data, not an address
+            continue
+
+        m = MOV_RX.search(line)
+        if m:
+            regs.pop(m.group(1), None)
+    return out
+
+
+def vaddr_reader(sections):
+    class _Reader:
+        def read(self, vaddr, n):
+            if vaddr <= 0:
+                return None
+            for s in sections:
+                if s["addr"] and s["size"] and s["addr"] <= vaddr < s["addr"] + s["size"]:
+                    base = vaddr - s["addr"]
+                    return s["data"][base : base + n]
+            return None
+
+    return _Reader()
+
+
+def deref_slice(image, relocs, addr):
+    """Follow a Go slice/string header global to the bytes it points at.
+
+    A `[]byte{...}` literal that the compiler keeps in a global is stored as a
+    three-word header {ptr, len, cap} in .data; the pointer is only filled in by
+    the loader, so on disk the word reads 0 and the addend lives in .rela.dyn.
+    Returns (data_vaddr, bytes) or None when *addr* is not such a header.
+    """
+    hdr = image.read(addr, 24)
+    if not hdr or len(hdr) < 24:
+        return None
+    ptr = relocs.get(addr) or int.from_bytes(hdr[0:8], "little")
+    length = relocs.get(addr + 8) or int.from_bytes(hdr[8:16], "little")
+    if not ptr or not 0 < length <= FB_NEED * 4:
+        return None
+    blob = image.read(ptr, length)
+    if not blob or len(blob) < length:
+        return None
+    return ptr, blob
+
+
+def scheme_b_candidates(lines, image, addrs, relocs):
+    """(label, raw obfuscated bytes) candidates for the scheme B key arrays."""
+    out = []
+    stream = arm64_immediate_stream(lines)
+    for start in range(len(stream)):
+        for force in (None, 8):
+            buf = imm_stream_bytes(stream, start, FB_NEED, force)
+            if len(buf) >= FB_NEED:
+                out.append((f"{'imm.w8' if force else 'imm.nat'}@{start}", buf))
+    for addr in addrs:
+        blob = image.read(addr, FB_NEED)
+        if blob and len(blob) >= FB_NEED:
+            out.append((f"global 0x{addr:x}", blob))
+        got = deref_slice(image, relocs, addr)
+        if got:
+            ptr, data = got
+            out.append((f"slice 0x{addr:x}->0x{ptr:x} ({len(data)}B)", data))
+    return out
+
+
+def run_scheme_a(lib):
+    print("[3/4] locating DecodeAESBase64 with Go pclntab")
+    fn = find_go_func(lib, "convert.DecodeAESBase64")
+    aes = find_go_func(lib, "convert.aesDecryptCBC")
+    print(f"      {fn['line']}")
+    print(f"      {aes['line']}")
+
+    print("[4/4] extracting arm64 prologue constants")
+    lines = disassemble(lib, fn["entry"], fn["entry"] + min(fn["size"], 512))
+    constants = extract_arm64_movk_constants(lines)
+    for i, c in enumerate(constants, 1):
+        print(f"      imm{i}: {c['bytes']!r}    {c['line']}")
+
+    key = constants[0]["bytes"] + constants[1]["bytes"]
+    iv = constants[2]["bytes"] + constants[3]["bytes"]
+    print()
+    print(f"AES-128-CBC KEY ascii: {key.decode('ascii')}")
+    print(f"AES-128-CBC IV  ascii: {iv.decode('ascii')}")
+    print(f"AES-128-CBC KEY hex:   {key.hex()}")
+    print(f"AES-128-CBC IV  hex:   {iv.hex()}")
+
+
+def run_scheme_b(lib, raw_dump):
+    print("[3/4] locating scheme B key builders with Go pclntab")
+    pcln, text_addr = find_go_pclntab_in_elf64_le(lib)
+    funcs = GoPclnTable(pcln, text_addr).funcs()
+
+    def pick(*needles):
+        for needle in needles:
+            exact = [f for f in funcs if f["name"] == needle]
+            if exact:
+                return exact[0]
+        for needle in needles:
+            prefixed = sorted(
+                (f for f in funcs if f["name"].startswith(needle)), key=lambda f: len(f["name"])
+            )
+            if prefixed:
+                return prefixed[0]
+        return None
+
+    secret = pick("main.configSecretBytes")
+    xor_key = pick("main.diskXorKey.func1", "main.diskXorKey")
+    if secret is None and xor_key is None:
+        raise Die(
+            "neither main.configSecretBytes nor main.diskXorKey was found via Go pclntab - "
+            "this libclash.so does not look like the scheme B layout"
+        )
+    for f in (xor_key, secret):
+        if f:
+            print(f"      {f['name']}  entry=0x{f['entry']:x} size={f['size']}")
+
+    print("[4/4] recovering the obfuscated key arrays")
+    lib_data = Path(lib).read_bytes()
+    sections = read_elf64_le_sections(lib_data)
+    image = vaddr_reader(sections)
+    relocs = read_relocations(lib_data, sections)
+
+    found = {}
+    dumped = {}
+    segments = {"a": [], "b": [], "c": []}
+
+    for f, kind in ((xor_key, "xor"), (secret, "seed")):
+        if f is None:
+            continue
+        lines = disassemble(lib, f["entry"], f["entry"] + min(f["size"], 2048))
+        addrs = arm64_global_addrs(lines, relocs)
+        items = scheme_b_candidates(lines, image, addrs, relocs)
+        dumped[kind] = items
+        print(f"      {f['name']}: {len(items)} candidate array(s), {len(addrs)} data ref(s)")
+
+        for label, blob in items:
+            if kind == "xor":
+                value = fb_disk_xor_key(blob)
+                if is_printable(value, FB_DISK_XOR_LEN):
+                    found.setdefault(kind, (value, label, blob))
+            else:
+                value = fb_config_secret(blob)
+                if value is not None and is_printable(value, FB_SEED_LEN):
+                    found.setdefault(kind, (value, label, blob))
+
+        if kind == "seed":
+            # the three obfuscated chunks are separate []byte globals; their lengths
+            # (10/10/12) tell them apart and ascending header order is chunk order
+            slices = []
+            for addr in sorted(set(addrs)):
+                got = deref_slice(image, relocs, addr)
+                if got:
+                    slices.append((addr, got[1]))
+            for i in range(len(slices)):
+                run = b""
+                for _, blob in slices[i : i + 3]:
+                    run += blob
+                    if len(run) >= FB_SEED_LEN:
+                        break
+                if len(run) >= FB_SEED_LEN:
+                    value = fb_config_secret(run[:FB_SEED_LEN])
+                    if value is not None and is_printable(value, FB_SEED_LEN):
+                        found.setdefault(kind, (value, f"slice run @0x{slices[i][0]:x}", run))
+            for slot, fn, size in (
+                ("a", fb_seed_first, 10),
+                ("b", fb_seed_second, 10),
+                ("c", fb_seed_third, 12),
+            ):
+                if segments[slot]:
+                    continue
+                for addr, blob in slices:
+                    if len(blob) != size:
+                        continue
+                    piece = fn(blob)
+                    if is_printable(piece, size):
+                        segments[slot].append((piece, f"0x{addr:x}"))
+                        break
+
+    if all(segments[slot] for slot in "abc"):
+        seed = segments["a"][0][0] + segments["b"][0][0] + segments["c"][0][0]
+        found.setdefault("seed", (seed, "split arrays a+b+c", b""))
+
+    if raw_dump:
+        for kind, items in dumped.items():
+            for label, blob in items[:24]:
+                print(f"      raw {kind}: {blob.hex()}  ({label})")
+            if len(items) > 24:
+                print(f"      raw {kind}: ... {len(items) - 24} more")
+        for slot in "abc":
+            for piece, where in segments[slot][:6]:
+                print(f"      seg {slot}: {piece!r}  ({where})")
+
+    print()
+    if "xor" in found:
+        value, label, _ = found["xor"]
+        print(f"disk XOR key (35 B ascii): {value.decode('ascii')}    [{label}]")
+    else:
+        print("disk XOR key (35 B ascii): <not recovered - rerun with --raw>")
+    if "seed" in found:
+        value, label, _ = found["seed"]
+        print(f"AES seed     (32 B ascii): {value.decode('ascii')}    [{label}]")
+        print(f"AES-256-GCM key   hex:     {hashlib.sha256(value).digest().hex()}")
+    else:
+        print("AES seed     (32 B ascii): <not recovered - rerun with --raw>")
+
+
 def main(argv):
-    ap = argparse.ArgumentParser(description="Extract mihomo AES KEY/IV from Android APK libclash.so.")
+    ap = argparse.ArgumentParser(
+        description="Extract mihomo profile-encryption key material from an Android APK's libclash.so."
+    )
     ap.add_argument("apk", help="path to APK")
     ap.add_argument("--abi", default="arm64-v8a", help="APK ABI to inspect, default: arm64-v8a")
+    ap.add_argument("--scheme", choices=("auto", "a", "b"), default="auto",
+                    help="force a scheme instead of auto-detecting")
+    ap.add_argument("--raw", action="store_true", help="dump candidate obfuscated arrays")
     args = ap.parse_args(argv)
 
     apk = Path(os.path.expanduser(args.apk)).resolve()
@@ -311,31 +771,23 @@ def main(argv):
         lib = extract_lib(apk, args.abi, td)
         print(f"      {lib}")
 
-        print("[2/4] checking mihomo convert symbols")
-        symbols = check_mihomo_symbols(lib)
-        for s in symbols:
-            if "DecodeAESBase" in s or "aesDecryptCBC" in s:
-                print(f"      {s}")
+        print("[2/4] detecting profile encryption scheme")
+        detected, evidence = detect_scheme(lib)
+        scheme = detected if args.scheme == "auto" else args.scheme.upper()
+        if scheme == "?":
+            raise Die(
+                "no known profile-encryption scheme in libclash.so: neither "
+                "convert.DecodeAESBase64 (scheme A) nor main.configSecretBytes (scheme B) is present"
+            )
+        note = "" if scheme == detected else f"  (forced; auto-detect said {detected})"
+        print(f"      scheme {scheme}{note}")
+        for line in evidence:
+            print(f"      {line}")
 
-        print("[3/4] locating DecodeAESBase64 with Go pclntab")
-        fn = find_go_func(lib, "convert.DecodeAESBase64")
-        aes = find_go_func(lib, "convert.aesDecryptCBC")
-        print(f"      {fn['line']}")
-        print(f"      {aes['line']}")
-
-        print("[4/4] extracting arm64 prologue constants")
-        lines = disassemble(lib, fn["entry"], fn["entry"] + min(fn["size"], 512))
-        constants = extract_arm64_movk_constants(lines)
-        for i, c in enumerate(constants, 1):
-            print(f"      imm{i}: {c['bytes']!r}    {c['line']}")
-
-    key = constants[0]["bytes"] + constants[1]["bytes"]
-    iv = constants[2]["bytes"] + constants[3]["bytes"]
-    print()
-    print(f"AES-128-CBC KEY ascii: {key.decode('ascii')}")
-    print(f"AES-128-CBC IV  ascii: {iv.decode('ascii')}")
-    print(f"AES-128-CBC KEY hex:   {key.hex()}")
-    print(f"AES-128-CBC IV  hex:   {iv.hex()}")
+        if scheme == "A":
+            run_scheme_a(lib)
+        else:
+            run_scheme_b(lib, args.raw)
 
 
 if __name__ == "__main__":
