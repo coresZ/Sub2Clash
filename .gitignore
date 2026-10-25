@@ -12,3 +12,4 @@ env/
 uv.lock
 /demo
 skills
+*.apk
