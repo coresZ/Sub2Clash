@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from apex.getinfo import Apex
 from core.ApkConfigUrlExtractor import getAppConfigUrl, getAppConfigData
 from core.config import HeadersHandle, HEADERS
 from flclash import decrypt_mihomo_profile, extract_mihomo_apk_aes
@@ -29,6 +30,15 @@ def run(username: str, password: str, apk_path: str) -> None:
         except (extract_mihomo_apk_aes.Die, decrypt_mihomo_profile.Die, ValueError) as e:
             print(f"flclash处理失败: {e}")
         return
+
+    # 匹配到apex处理流程
+    print("匹配到apex处理流程......")
+    try:
+        with Apex(username=username, password=password, apk_path=apk_path) as apex:
+            if apex.apexGetSubData():
+                return
+    except Exception as e:
+        print(f"apex处理失败: {e}")
 
     # 获取配置文件的url
     print("获取登录的接口......")
